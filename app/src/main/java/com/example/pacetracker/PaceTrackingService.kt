@@ -20,10 +20,11 @@ class PaceTrackingService : Service(), TextToSpeech.OnInitListener {
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var tts: TextToSpeech
-    private var lastLocation: Location? = null
-    private var lastTime: Long = 0L
     private var currentPaceStr: String = "--:--"
     private var lastSpeakTime: Long = 0L  // track last time TTS spoke
+    private val locationBuffer = ArrayDeque<Pair<Location, Long>>()
+    private val bufferDurationMs = 5000L   // 5-second smoothing window
+    private var smoothedSpeed = -1.0       // for exponential smoothing
 
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION])
@@ -67,44 +68,71 @@ class PaceTrackingService : Service(), TextToSpeech.OnInitListener {
     }
 
     private val locationCallback = object : LocationCallback() {
+
         override fun onLocationResult(result: LocationResult) {
             val location = result.lastLocation ?: return
-            val currentTime = System.currentTimeMillis()
+            val now = System.currentTimeMillis()
 
-            val speedMps = if (lastLocation != null && lastTime > 0L) {
-                val distance = lastLocation!!.distanceTo(location).toDouble()
-                val deltaTime = (currentTime - lastTime) / 1000.0
-                if (deltaTime > 0.0) distance / deltaTime else location.speed.toDouble()
-            } else {
-                location.speed.toDouble()
+            // 1. Ignore bad GPS accuracy
+            if (location.accuracy > 20f) return   // <–– important
+
+            // 2. Add new point to buffer
+            locationBuffer.addLast(location to now)
+
+            // Remove old points
+            while (locationBuffer.isNotEmpty() &&
+                locationBuffer.first().second < now - bufferDurationMs) {
+                locationBuffer.removeFirst()
             }
 
-            lastLocation = location
-            lastTime = currentTime
+            // 3. Calculate speed
+            val rawSpeedMps = when {
+                location.hasSpeed() -> location.speed.toDouble()   // best source
+                locationBuffer.size > 1 -> {
+                    // fallback: distance over last ~5 seconds
+                    var dist = 0.0
+                    val pts = locationBuffer.toList()
+                    for (i in 1 until pts.size) {
+                        dist += pts[i-1].first.distanceTo(pts[i].first)
+                    }
+                    val dt = (pts.last().second - pts.first().second) / 1000.0
+                    if (dt > 0) dist / dt else 0.0
+                }
+                else -> 0.0
+            }
 
-            val speedKmh = speedMps * 3.6
-            val paceMinPerKm = if (speedKmh > 0) 60.0 / speedKmh else Double.POSITIVE_INFINITY
+            // 4. Apply exponential moving average for smoothness
+            val alpha = 0.25  // higher = more reactive, lower = smoother
+            smoothedSpeed = when {
+                smoothedSpeed < 0 -> rawSpeedMps     // first value
+                else -> (alpha * rawSpeedMps) + ((1 - alpha) * smoothedSpeed)
+            }
 
+            val speedKmh = smoothedSpeed * 3.6
+            val paceMinPerKm = if (speedKmh > 0.5) 60.0 / speedKmh else Double.POSITIVE_INFINITY
+
+            // 5. Format pace into readable string
             currentPaceStr = if (paceMinPerKm.isInfinite() || paceMinPerKm > 20) {
                 "--:--"
             } else {
-                val minutes = paceMinPerKm.toInt()
-                val seconds = ((paceMinPerKm - minutes) * 60).toInt()
-                String.format("%d:%02d min/km", minutes, seconds)
+                val min = paceMinPerKm.toInt()
+                val sec = ((paceMinPerKm - min) * 60).toInt()
+                String.format("%d:%02d min/km", min, sec)
             }
 
-            // ---- SPEAK ONLY EVERY 1 MINUTE ----
-            if (currentTime - lastSpeakTime > 60_000) {
+            // 6. Speak every 1 minute
+            if (now - lastSpeakTime > 60_000) {
                 tts.speak(
                     "Your current pace is $currentPaceStr",
                     TextToSpeech.QUEUE_FLUSH,
                     null,
                     "paceId"
                 )
-                lastSpeakTime = currentTime
+                lastSpeakTime = now
             }
         }
     }
+
 
     override fun onDestroy() {
         fusedLocationClient.removeLocationUpdates(locationCallback)
